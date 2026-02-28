@@ -1,0 +1,43 @@
+name: Nightly Kixie KPI Report
+
+on:
+  schedule:
+    - cron: '0 4 * * 1-5'   # 11 PM Bogotá (UTC-5) Mon–Fri = 4 AM UTC
+  workflow_dispatch:          # manual trigger from GitHub UI
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests gspread google-auth
+
+      - name: Run report.py
+        env:
+          AIRTABLE_API_KEY:        ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID:        ${{ secrets.AIRTABLE_BASE_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          GSHEET_ID:               ${{ secrets.GSHEET_ID }}
+          CI:                      "true"
+        run: python report.py
+
+      - name: Commit greg_report.html if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add greg_report.html
+          if git diff --staged --quiet; then
+            echo "No changes to greg_report.html"
+          else
+            git commit -m "chore: nightly KPI report refresh $(date -u '+%Y-%m-%d')"
+            git push
+          fi

@@ -4,7 +4,7 @@ report.py — Full multi-year AIC KPI report + sidebar with Dial Volume,
 Connection Rate, Efficiency, and Call Timing Heatmap views.
 Run: python3 report.py
 """
-import csv, json, webbrowser, datetime, calendar
+import csv, json, webbrowser, datetime, calendar, os, sys
 from pathlib import Path
 from collections import defaultdict
 
@@ -324,6 +324,170 @@ def load_aic_records(files):
                     "is_outbound": is_outbound,
                 })
     return records
+
+# ── Airtable data source ──────────────────────────────────────────────────────
+
+AIRTABLE_TABLE = "Kixie Call Log"
+AGENT_NAME_MAP = {
+    "Edgar":   "Edgar Morales",
+    "Leandro": "Leandro Greasebook",
+}
+
+def fetch_airtable(api_key, base_id):
+    """Fetch all records from the Airtable Kixie Call Log table (paginated)."""
+    try:
+        import requests as _req
+    except ImportError:
+        print("ERROR: `requests` not installed. Run: pip install requests")
+        sys.exit(1)
+
+    url     = f"https://api.airtable.com/v0/{base_id}/{_req.utils.quote(AIRTABLE_TABLE)}"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    records, params = [], {"pageSize": 100}
+    while True:
+        r = _req.get(url, headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        records.extend(data.get("records", []))
+        offset = data.get("offset")
+        if not offset:
+            break
+        params["offset"] = offset
+    return records
+
+
+def transform_airtable_records(raw):
+    """Convert Airtable records into the same dicts load_all() / load_aic_records() produce."""
+    records, aic_records, seen = [], [], set()
+    for rec in raw:
+        f  = rec.get("fields", {})
+        dt = parse_dt(f.get("call_datetime") or f.get("call_date") or "")
+        if not dt:
+            continue
+        agent_short = f.get("agent", "")
+        agent       = AGENT_NAME_MAP.get(agent_short, agent_short)
+        direction   = (f.get("direction") or "outgoing").lower()
+        is_outbound = direction in ("outgoing", "outbound")
+        disposition = f.get("disposition", "")
+        duration_s  = int(f.get("duration_sec") or 0)
+        call_id     = f.get("call_id") or rec["id"]
+
+        key = f"{agent}|{dt.isoformat()}|{call_id}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        aic_records.append({"dt": dt, "agent": agent, "is_outbound": is_outbound})
+        if is_outbound:
+            records.append({
+                "dt": dt, "agent": agent,
+                "status": "", "disposition": disposition, "duration_sec": duration_s,
+            })
+    return records, aic_records
+
+
+def write_sheet_metrics(aic, counts, conn_daily):
+    """Compute 24 BDR KPI summary values and write to Dashboard Summary Sheet Block E."""
+    import json as _json
+
+    gsheet_id  = os.environ.get("GSHEET_ID", "1RfGRwfRQlwPAenslF7X6yvBT1XLC-CHm85KfqNV9SK0")
+    creds_raw  = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+    if not creds_raw:
+        print("  GOOGLE_CREDENTIALS_JSON not set — skipping Sheet write")
+        return
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        print("  ERROR: gspread / google-auth not installed — skipping Sheet write")
+        return
+
+    creds = Credentials.from_service_account_info(
+        _json.loads(creds_raw),
+        scopes=["https://spreadsheets.google.com/feeds",
+                "https://www.googleapis.com/auth/drive"],
+    )
+    gc = gspread.authorize(creds)
+    ws = gc.open_by_key(gsheet_id).worksheet("Dashboard Summary")
+
+    today = datetime.date.today()
+
+    # Last complete Mon-Fri week
+    days_since_mon = today.weekday()           # 0 = Mon
+    lw_start = today - datetime.timedelta(days=days_since_mon + 7)
+    lw_end   = lw_start + datetime.timedelta(days=4)
+
+    # 4wk window ending on lw_end
+    w4_start = lw_end - datetime.timedelta(days=27)
+
+    # 90d = last 3 complete calendar months
+    cur_month_start = datetime.date(today.year, today.month, 1)
+    months_90d = []
+    for delta in (3, 2, 1):
+        m = cur_month_start.replace(day=1)
+        for _ in range(delta):
+            m = (m - datetime.timedelta(days=1)).replace(day=1)
+        months_90d.append((m.year, m.month))
+
+    def _sum_period(daily, agent, start, end):
+        return sum(v for d, v in daily.get(agent, {}).items() if start <= d <= end)
+
+    def _sum_months(daily, agent, yms):
+        return sum(monthly_sum(daily.get(agent, {}), y, m) for y, m in yms)
+
+    REPS = [
+        ("edgar",   "Edgar Morales"),
+        ("leandro", "Leandro Greasebook"),
+    ]
+
+    rows = []
+    for key, full_name in REPS:
+        aic_lw      = _sum_period(aic, full_name, lw_start, lw_end) / 60
+        aic_4wk_tot = _sum_period(aic, full_name, w4_start, lw_end) / 60
+        aic_4wk     = aic_4wk_tot / 4
+        aic_90d_tot = _sum_months(aic, full_name, months_90d) / 60
+        aic_90d     = aic_90d_tot / 13
+
+        calls_lw      = _sum_period(counts, full_name, lw_start, lw_end)
+        calls_4wk_tot = _sum_period(counts, full_name, w4_start, lw_end)
+        calls_4wk     = calls_4wk_tot / 4
+        calls_90d_tot = _sum_months(counts, full_name, months_90d)
+        calls_90d     = calls_90d_tot / 13
+
+        conn_lw      = _sum_period(conn_daily, full_name, lw_start, lw_end)
+        conn_4wk     = _sum_period(conn_daily, full_name, w4_start, lw_end)
+        conn_90d_tot = _sum_months(conn_daily, full_name, months_90d)
+
+        conn_rate_lw  = round(conn_lw  / calls_lw  * 100, 2) if calls_lw  else None
+        conn_rate_4wk = round(conn_4wk / calls_4wk_tot * 100, 2) if calls_4wk_tot else None
+        conn_rate_90d = round(conn_90d_tot / calls_90d_tot * 100, 2) if calls_90d_tot else None
+
+        aic_min_lw  = _sum_period(aic, full_name, lw_start, lw_end)
+        aic_min_4wk = _sum_period(aic, full_name, w4_start, lw_end)
+        aic_min_90d = _sum_months(aic, full_name, months_90d)
+
+        eff_lw  = round(calls_lw  / (aic_min_lw  / 60), 1) if aic_min_lw  > 0 else None
+        eff_4wk = round(calls_4wk / (aic_min_4wk / 60 / 4), 1) if aic_min_4wk > 0 else None
+        eff_90d = round(calls_90d_tot / (aic_min_90d / 60), 1) if aic_min_90d > 0 else None
+
+        rows.append([f"{key}_aic_lw",   str(round(aic_lw,  2))])
+        rows.append([f"{key}_aic_4wk",  str(round(aic_4wk, 2))])
+        rows.append([f"{key}_aic_90d",  str(round(aic_90d, 2))])
+        rows.append([f"{key}_calls_lw",  str(round(calls_lw,  0))])
+        rows.append([f"{key}_calls_4wk", str(round(calls_4wk, 0))])
+        rows.append([f"{key}_calls_90d", str(round(calls_90d, 0))])
+        rows.append([f"{key}_conn_lw",  str(conn_rate_lw)  if conn_rate_lw  is not None else ""])
+        rows.append([f"{key}_conn_4wk", str(conn_rate_4wk) if conn_rate_4wk is not None else ""])
+        rows.append([f"{key}_conn_90d", str(conn_rate_90d) if conn_rate_90d is not None else ""])
+        rows.append([f"{key}_eff_lw",   str(eff_lw)  if eff_lw  is not None else ""])
+        rows.append([f"{key}_eff_4wk",  str(eff_4wk) if eff_4wk is not None else ""])
+        rows.append([f"{key}_eff_90d",  str(eff_90d) if eff_90d is not None else ""])
+
+    # Write all 24 rows to Block E starting at row 92
+    ws.update("A92:B115", rows, value_input_option="RAW")
+    print(f"  ✓ Sheet updated — {len(rows)} rows written to Block E (rows 92-115)")
+
 
 # ── Compute ───────────────────────────────────────────────────────────────────
 
@@ -1040,14 +1204,24 @@ def build_html(aic, counts, conn_daily, hour_dials, hour_conns, dow_dials, dow_c
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
-    print("Loading CSVs…")
-    records     = load_all(ALL_FILES)
-    aic_records = load_aic_records(ALL_FILES)
+    airtable_key = os.environ.get("AIRTABLE_API_KEY")
+    base_id      = os.environ.get("AIRTABLE_BASE_ID")
+
+    if airtable_key and base_id:
+        print("Fetching from Airtable…")
+        raw      = fetch_airtable(airtable_key, base_id)
+        records, aic_records = transform_airtable_records(raw)
+        print(f"  {len(raw)} Airtable records fetched")
+    else:
+        print("Loading CSVs… (set AIRTABLE_API_KEY + AIRTABLE_BASE_ID to use Airtable)")
+        records     = load_all(ALL_FILES)
+        aic_records = load_aic_records(ALL_FILES)
+
     print(f"Total unique outbound calls: {len(records):,}")
     print(f"Total calls for AIC (in+out): {len(aic_records):,}\n")
 
-    aic    = compute_aic(aic_records)
-    counts = call_counts(records)
+    aic        = compute_aic(aic_records)
+    counts     = call_counts(records)
     conn_daily = compute_connections(records)
     hour_dials, hour_conns, dow_dials, dow_conns = compute_heatmaps(records)
 
@@ -1062,10 +1236,18 @@ def main():
               f"{total_conns} connections ({rate:.2f}%)")
 
     html = build_html(aic, counts, conn_daily, hour_dials, hour_conns, dow_dials, dow_conns, records)
-    out  = Path.home() / "kixie-kpi" / "greg_report.html"
+    out  = Path("greg_report.html")
     out.write_text(html, encoding="utf-8")
-    print(f"\nReport → {out}")
-    webbrowser.open(f"file://{out}")
+    print(f"\nReport → {out.resolve()}")
+
+    # Write KPI summaries to Google Sheet (skipped if creds not set)
+    if airtable_key:
+        print("\nWriting summary metrics to Google Sheet…")
+        write_sheet_metrics(aic, counts, conn_daily)
+
+    # Open in browser only when running locally (not in CI)
+    if not os.environ.get("CI"):
+        webbrowser.open(f"file://{out.resolve()}")
 
 
 if __name__ == "__main__":
